@@ -1,0 +1,16 @@
+.env
+enviados.json
+__pycache__/
+*.pyc
+
+# Ambientes virtuais e ferramentas
+.venv/
+.streamlit/
+.idea/
+.vscode/
+*.log
+
+# Dados locais
+data/
+temp/
+*.pdf
