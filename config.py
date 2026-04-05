@@ -21,9 +21,21 @@ CHAT_ID            = os.environ.get("CHAT_ID", "7197692719")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 # ── IA Config ────────────────────────────────────────────────
-MODEL_IA = "z-ai/glm-4.5-air:free"
-# Modelo reserva caso o principal esteja fora do ar
-MODEL_IA_FALLBACK = "meta-llama/llama-3.1-8b-instruct:free"
+# Agora estruturado em perfis para seleção dinâmica na interface
+PERFIS_IA = {
+    "Econômico (Grátis) 🍃": {
+        "primary": "z-ai/glm-4.5-air:free",
+        "fallback": "google/gemini-flash-1.5:free"
+    },
+    "Premium (GPT-4o) 💎": {
+        "primary": "openai/gpt-4o-mini",
+        "fallback": "google/gemini-2.0-flash-001"
+    }
+}
+
+# Valores padrão (Econômico por padrão conforme solicitado)
+MODEL_IA = PERFIS_IA["Econômico (Grátis) 🍃"]["primary"]
+MODEL_IA_FALLBACK = PERFIS_IA["Econômico (Grátis) 🍃"]["fallback"]
 
 # ── Filtros de CNAE Híbridos ─────────────────────────────────
 
@@ -61,8 +73,37 @@ BLACKLIST_PRODUTOS = [
 ]
 
 UFS_REGIONAL   = ["GO", "DF"]
-MODALIDADES    = {6: "Pregão Eletrônico", 7: "Dispensa Eletrônica", 1: "Concorrência"}
+MODALIDADES    = {
+    1: "Leilão", 
+    2: "Diálogo Competitivo", 
+    3: "Concurso", 
+    4: "Concorrência", 
+    5: "Pregão", 
+    6: "Dispensa", 
+    7: "Inexigibilidade", 
+    14: "Credenciamento"
+}
 VALOR_MINIMO   = 5_000
 
 # ── Arquivo de deduplicação ──────────────────────────────────
 ENVIADOS_JSON  = Path(__file__).parent / "enviados.json"
+
+# ── Dicionário de Inteligência CNAE ───────────────────────────
+DICIONARIO_CNAE = {
+    "8610-1/02": "Atividades de atendimento em pronto-socorro e unidades hospitalares para atendimento a urgências",
+    "8630-5/02": "Atividade médica ambulatorial com recursos para realização de exames complementares",
+    "8630-5/03": "Atividade médica ambulatorial restrita a consultas",
+    "8660-7/00": "Atividades de apoio à gestão de saúde",
+    "8800-6/00": "Serviços de assistência social sem alojamento",
+    "8711-5/01": "Clínicas e residências geriátricas",
+    "8711-5/03": "Atividades de assistência a deficientes físicos, imunodeprimidos e convalescentes",
+    "8720-4/01": "Atividades de centros de assistência psicossocial",
+    "8720-4/99": "Atividades de assistência psicossocial e à saúde a portadores de distúrbios psíquicos, deficiência mental e dependência química",
+    # Infraestrutura (Exemplos comuns)
+    "4211-1/01": "Construção de rodovias e ferrovias",
+    "4321-5/00": "Instalação e manutenção elétrica",
+    "4322-3/02": "Instalação e manutenção de sistemas centrais de ar condicionado, de ventilação e refrigeração",
+    "8121-4/00": "Limpeza em prédios e em domicílios",
+    "8129-0/00": "Atividades de limpeza não especificadas anteriormente",
+    "8130-3/00": "Atividades de paisagismo"
+}

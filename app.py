@@ -1,15 +1,5 @@
 """
-LicitaAI — Monitor de Licitações · PE&CR Soluções Ltda
-Streamlit · API pública PNCP · sem autenticação · sem custo
-
-Melhorias implementadas:
-  ✅ Credenciais lidas do .env (nunca expostas no código)
-  ✅ Deduplicação: editais já enviados ao Telegram não são reenviados
-  ✅ Cache com @st.cache_data para evitar re-requests desnecessários
-  ✅ Rate-limit robusto com retry automático (backoff exponencial)
-  ✅ Filtro adicional por município
-  ✅ Alerta visual quando CHAT_ID não está configurado
-  ✅ Contador de novos × já enviados na interface
+LicitaAI — Inteligência de Mercado · V2.1 (Sincronização Ativa)
 """
 
 import pypdf
@@ -20,14 +10,18 @@ import json
 import os
 import re
 import datetime
+import base64
+import fitz
 from pathlib import Path
 from io import BytesIO
+import html
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config import (
     TOKEN_TELEGRAM, CHAT_ID, CNAES_FEDERAL, CNAES_REGIONAL,
     UFS_REGIONAL, BLACKLIST_PRODUTOS, MODALIDADES, 
-    VALOR_MINIMO, ENVIADOS_JSON, OPENROUTER_API_KEY, MODEL_IA, MODEL_IA_FALLBACK,
+    VALOR_MINIMO, ENVIADOS_JSON, OPENROUTER_API_KEY, PERFIS_IA,
+    DICIONARIO_CNAE,
 )
 
 # ── Configuração da página ──────────────────────────────────
@@ -220,13 +214,14 @@ def _salvar_enviados(ids: set):
     )
 
 def limpar_html(texto: str) -> str:
-    """Remove tags HTML residuais e escapa chaves {} que quebram f-strings."""
+    """Remove tags HTML residuais e sanitiza o texto para exibição segura."""
     if not texto: return ""
     # Remove tags como <div>, <p>, <br>, etc.
-    clean = re.compile('<.*?>')
+    clean = re.compile(r'<[^>]*>')
     texto = re.sub(clean, '', texto)
-    # Escapa chaves para não quebrar f-strings do Streamlit/HTML
-    return texto.replace("{", "[").replace("}", "]")
+    # Remove espaços duplos e quebras de linha excessivas
+    texto = " ".join(texto.split())
+    return texto
 
 @st.cache_data(ttl=3600)
 def buscar_arquivos_pncp(cnpj: str, ano: str, seq: str) -> list[dict]:
@@ -310,10 +305,10 @@ def _get_com_retry(url: str, tentativas: int = 3) -> list[dict]:
 def extrair_texto_pdf(pdf_file) -> str:
     """Extrai texto de um arquivo PDF carregado via Streamlit com indicador de progresso."""
     try:
+        pdf_file.seek(0)
         reader = pypdf.PdfReader(pdf_file)
         texto_completo = ""
         total_pags = len(reader.pages)
-        # Limitamos a 50 páginas para evitar estourar o contexto da IA free
         num_paginas = min(total_pags, 50)
         
         prog_extracao = st.progress(0, text=f"⏳ Iniciando leitura de {num_paginas} páginas...")
@@ -326,16 +321,101 @@ def extrair_texto_pdf(pdf_file) -> str:
             
         prog_extracao.empty()
         
-        # SANEAMENTO: Remove caracteres nulos e de controle que quebram o JSON da API
         texto_completo = texto_completo.replace("\x00", "").replace("\r", " ")
-        # Remove espaços excessivos e normaliza quebras
         texto_completo = re.sub(r'\n{3,}', '\n\n', texto_completo)
         
         return texto_completo.strip()
     except Exception as e:
         return f"Erro ao ler PDF: {str(e)}"
 
-def obter_pergunta_ia(pergunta: str, contexto: str, historico: list) -> str:
+def extrair_paginas_como_imagens(pdf_file, max_paginas=3) -> list:
+    """Converte as primeiras páginas do PDF em imagens base64 para IA de Visão."""
+    images_b64 = []
+    try:
+        pdf_file.seek(0)
+        doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
+        num_paginas = min(len(doc), max_paginas)
+        
+        for i in range(num_paginas):
+            page = doc.load_page(i)
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2)) # Zoom 2x para melhor OCR pela IA
+            img_data = pix.tobytes("jpg")
+            b64 = base64.b64encode(img_data).decode("utf-8")
+            images_b64.append(f"data:image/jpeg;base64,{b64}")
+        
+        doc.close()
+        return images_b64
+    except Exception as e:
+        st.error(f"Erro na extração visual: {e}")
+        return []
+
+def gerar_resumo_proativo_ia(texto: str, model_ia: str, fallback: str, imagens_b64: list = None) -> str:
+    """Gera um relatório automático estruturado. Suporta modo texto ou visão."""
+    if not OPENROUTER_API_KEY:
+        return ""
+    
+    # Bug fix: Ativa visão se houver qualquer imagem, independente do tamanho do texto digital
+    is_vision = bool(imagens_b64)
+    
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://licitaai.local",
+        "X-Title": "LicitaAI Proactive Analyst"
+    }
+
+    instrucoes = """
+    Como um Auditor Master de Licitações da PE&CR Soluções, faça uma análise profilática e estratégica do edital.
+    Se você recebeu imagens, faça o OCR mental e extraia os dados visuais.
+    IMPORTANTE: Não invente dados. Se não identificar algo, escreva 'Não localizado no documento'.
+    
+    ESTRUTURA OBRIGATÓRIA DA RESPOSTA (Markdown):
+    ### 🏛️ Relatório de Inteligência: [Nome/Órgão do Edital]
+    
+    1. **Objeto Principal**: (Explique em 1 parágrafo o que está sendo contratado)
+    2. **Prazos e Datas Críticas**: (Data de abertura, lances, pedidos de esclarecimentos)
+    3. **Valor e Julgamento**: (Valor estimado total, critério de julgamento como menor preço, etc)
+    4. **Habilitação e Exigências**: (Liste os principais documentos e atestados técnicos exigidos)
+    5. **Plataforma/Local**: (Onde ocorrerá a disputa)
+    
+    ### ⚖️ Nota de Viabilidade (0-10)
+    **Nota: [X]/10**
+    *Justificativa*: (Diga se o edital é viável e quais os riscos ou pontos de atenção)
+    """
+
+    if is_vision:
+        content = [{"type": "text", "text": f"Analise as páginas escaneadas deste edital:\n\n{instrucoes}"}]
+        for img in imagens_b64:
+            content.append({"type": "image_url", "image_url": {"url": img}})
+        messages = [{"role": "user", "content": content}]
+        st.warning("👁️ Modo Visão Ativado: Detectado edital escaneado. Capturando detalhes visuais...")
+    else:
+        full_prompt = f"{instrucoes}\n\nCONTEÚDO DO EDITAL:\n{texto[:35000]}"
+        messages = [{"role": "user", "content": full_prompt}]
+
+    try:
+        r = requests.post(url, headers=headers, json={
+            "model": model_ia,
+            "messages": messages,
+            "temperature": 0.2
+        }, timeout=90)
+        
+        if r.status_code in [400, 404, 429]:
+            r = requests.post(url, headers=headers, json={
+                "model": fallback,
+                "messages": messages,
+                "temperature": 0.2
+            }, timeout=90)
+            
+        if r.status_code != 200:
+            return f"⚠️ Erro ao gerar análise (HTTP {r.status_code})."
+            
+        return r.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"Erro na análise: {str(e)}"
+
+def obter_pergunta_ia(pergunta: str, contexto: str, historico: list, model_ia: str, fallback: str) -> str:
     """Envia pergunta sobre o PDF para a API OpenRouter com memória."""
     if not OPENROUTER_API_KEY:
         return "⚠️ Erro: OPENROUTER_API_KEY não configurada."
@@ -348,48 +428,57 @@ def obter_pergunta_ia(pergunta: str, contexto: str, historico: list) -> str:
         "X-Title": "LicitaAI Analyst"
     }
 
+    # Ativa visão se houver imagens salvas no estado
+    pdf_images = st.session_state.get("pdf_images", [])
+    is_vision = bool(pdf_images)
+    
     # Contexto do sistema com o conteúdo do edital
-    system_prompt = f"""
-    Você é o Analista Master de Licitações da PE&CR Soluções. 
-    Seu objetivo é analisar o edital abaixo e responder perguntas de forma técnica, estratégica e precisa.
-    Foque em prazos, valores, exigências técnicas (CNAE/Atestados) e riscos.
+    instrucoes = """Você é o Analista Master de Licitações da PE&CR Soluções. 
+    Analise o edital e responda perguntas de forma técnica, estratégica e precisa. 
+    Foque em prazos, valores, exigências técnicas e riscos. 
+    Não invente dados. Se não souber, diga que não localizou."""
     
-    CONTEÚDO DO EDITAL:
-    {contexto[:35000]} # Limite de segurança de caracteres (reduzido para evitar 400 Bad Request)
-    """
-    
-    messages = [{"role": "system", "content": system_prompt}]
-    # Adiciona histórico (memória)
-    for msg in historico[-6:]: # Mantém as últimas 6 mensagens para contexto solar
-        messages.append(msg)
-    # Adiciona pergunta atual
-    messages.append({"role": "user", "content": pergunta})
+    if is_vision:
+        content = [{"type": "text", "text": f"{instrucoes}\n\nPERGUNTA: {pergunta}\n(Analise também os prints de imagem anexados se necessário)"}]
+        for img in st.session_state.get("pdf_images", []):
+            content.append({"type": "image_url", "image_url": {"url": img}})
+        messages = [{"role": "user", "content": content}]
+    else:
+        system_prompt = f"{instrucoes}\n\nCONTEÚDO DO EDITAL:\n{contexto[:35000]}"
+        messages = [{"role": "system", "content": system_prompt}]
+        for msg in historico[-6:]:
+            messages.append(msg)
+        messages.append({"role": "user", "content": pergunta})
 
-    # TENTATIVA 1: Modelo Principal
+    # Tentativa com os modelos configurados
     try:
         r = requests.post(url, headers=headers, json={
-            "model": MODEL_IA,
+            "model": model_ia,
             "messages": messages,
             "temperature": 0.5
         }, timeout=45)
         
-        # Se falhar (400, 404, 429), partimos para o Fallback
+        # Fallback se houver falha crítica (400, 404, 429)
         if r.status_code in [400, 404, 429]:
             r = requests.post(url, headers=headers, json={
-                "model": MODEL_IA_FALLBACK,
+                "model": fallback,
                 "messages": messages,
                 "temperature": 0.5
             }, timeout=45)
         
+        if r.status_code == 429:
+            return "⏳ **Limite excedido (Rate Limit) no OpenRouter.** \nPor favor, aguarde 1 minuto e tente novamente ou adicione créditos à sua conta para evitar restrições de modelos gratuitos."
+            
         if r.status_code != 200:
-            return f"❌ Erro crítico em todos os modelos (HTTP {r.status_code}): {r.text}"
+            msg_erro = f"❌ Falha técnica na IA (HTTP {r.status_code}): {r.text} [ID: {model_ia if r.status_code != 200 else fallback}]"
+            return html.escape(msg_erro)
             
         return r.json()["choices"][0]["message"]["content"]
     except Exception as e:
-        return f"Erro na consulta à IA: {str(e)}"
+        return f"Erro de conexão com OpenRouter: {str(e)}"
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def obter_insight_ia(objeto: str, cnae: str) -> dict:
+@st.cache_data(ttl=300, show_spinner=False)
+def obter_insight_ia(objeto: str, cnae: str, model_ia: str, fallback: str) -> dict:
     """Consulta OpenRouter para analisar a viabilidade e estratégia do edital."""
     if not OPENROUTER_API_KEY:
         return {}
@@ -417,23 +506,23 @@ def obter_insight_ia(objeto: str, cnae: str) -> dict:
     }}
     """
 
-    # TENTATIVA 1: Modelo Principal
+    # Tentativa com Redundância
     try:
         r = requests.post(url, headers=headers, json={
-            "model": MODEL_IA,
+            "model": model_ia,
             "messages": [{"role": "user", "content": prompt}]
         }, timeout=20)
         
-        # Fallback se necessário
         if r.status_code in [400, 404, 429]:
             r = requests.post(url, headers=headers, json={
-                "model": MODEL_IA_FALLBACK,
+                "model": fallback,
                 "messages": [{"role": "user", "content": prompt}]
             }, timeout=20)
             
-        r.raise_for_status()
+        if r.status_code != 200:
+            return {}
+            
         raw = r.json()["choices"][0]["message"]["content"]
-        # Limpa possível markdown da resposta
         if "```json" in raw:
             raw = raw.split("```json")[1].split("```")[0]
         return json.loads(raw)
@@ -447,7 +536,7 @@ def render_ia_section(e: dict):
     
     with st.expander("✨ Ver Insight Estratégico (IA)", expanded=False):
         with st.spinner("Analisando edital com IA..."):
-            insight = obter_insight_ia(objeto, cnae)
+            insight = obter_insight_ia(objeto, cnae, model_ia=model_ia_ativo, fallback=fallback_ia_ativo)
             
         if not insight:
             st.info("Não foi possível gerar um insight para este edital no momento.")
@@ -462,8 +551,8 @@ def render_ia_section(e: dict):
         """, unsafe_allow_html=True)
 
 @st.cache_data(ttl=300, show_spinner=False)
-def buscar_pagina(di: str, df: str, uf: str, mod: int, pagina: int, termo: str = "") -> list[dict]:
-    """Busca uma página na API PNCP com suporte a filtro de termo."""
+def buscar_pagina(di: str, df: str, uf: str, mod: int, pagina: int, termo: str = "", uasg: str = "") -> list[dict]:
+    """Busca uma página na API PNCP com suporte a filtro de termo e UASG."""
     url = (f"{PNCP_BASE}/contratacoes/publicacao"
            f"?dataInicial={di}&dataFinal={df}"
            f"&codigoModalidadeContratacao={mod}"
@@ -472,11 +561,13 @@ def buscar_pagina(di: str, df: str, uf: str, mod: int, pagina: int, termo: str =
         url += f"&uf={uf}"
     if termo:
         url += f"&termo={requests.utils.quote(termo)}"
+    if uasg:
+        url += f"&codigoUnidadeAdministrativa={uasg}"
     
     return _get_com_retry(url)
 
 def _processar_edital(e: dict, radar: str, valor_min: float, municipio_filtro: str, termo_manual: str = "") -> dict | None:
-    """Aplica filtros locais a um edital individual."""
+    """Aplica filtros locais a um edital individual com filtragem estrita de termos."""
     obj = (e.get("objetoCompra") or "").lower()
 
     if any(term in obj for term in BLACKLIST_PRODUTOS):
@@ -484,6 +575,13 @@ def _processar_edital(e: dict, radar: str, valor_min: float, municipio_filtro: s
 
     if any(b in obj for b in ["software", "licença microsoft", "tecnologia da informação"]):
         return None
+
+    # Filtragem Estrita de Termos (Se houver termo_manual/CNAEs injetados)
+    if termo_manual:
+        # Quebramos o termo_manual em palavras-chave (removendo conectores curtos)
+        palavras_alvo = [p.lower() for p in termo_manual.split() if len(p) > 3]
+        if not any(p in obj for p in palavras_alvo):
+            return None
 
     val = e.get("valorTotalEstimado") or 0
     if val > 0 and val < valor_min:
@@ -498,24 +596,29 @@ def _processar_edital(e: dict, radar: str, valor_min: float, municipio_filtro: s
         return None
 
     match_cnae = None
-    if termo_manual:
-        match_cnae = "🔍 Explorador Manual"
-    else:
-        if radar == "FEDERAL":
-            for cnae_label, pal in CNAES_FEDERAL.items():
-                if any(p.lower() in obj for p in pal):
-                    match_cnae = cnae_label
-                    break
-        else:
-            for cnae_label, pal in CNAES_REGIONAL.items():
-                if any(p.lower() in obj for p in pal):
-                    match_cnae = cnae_label
-                    break
-            if not match_cnae:
-                for cnae_label, pal in CNAES_FEDERAL.items():
-                    if any(p.lower() in obj for p in pal):
-                        match_cnae = cnae_label
-                        break
+    
+    # 🧪 Match de Categorias (Ordem de Prioridade)
+    if radar == "FEDERAL":
+        for cnae_label, pal in CNAES_FEDERAL.items():
+            if any(p.lower() in obj for p in pal):
+                match_cnae = cnae_label
+                break
+    elif radar == "REGIONAL":
+        for cnae_label, pal in CNAES_REGIONAL.items():
+            if any(p.lower() in obj for p in pal):
+                match_cnae = cnae_label
+                break
+    
+    # Se ainda não deu match (ou estamos em modo manual), verificamos se bate com a descrição do CNAE
+    if not match_cnae and termo_manual:
+        match_cnae = "🔍 Termo Customizado"
+    
+    # Fallback final para Radar
+    if not match_cnae and radar != "EXPLORADOR":
+        for cnae_label, pal in {**CNAES_FEDERAL, **CNAES_REGIONAL}.items():
+            if any(p.lower() in obj for p in pal):
+                match_cnae = cnae_label
+                break
 
     if not match_cnae:
         return None
@@ -538,39 +641,42 @@ def _processar_edital(e: dict, radar: str, valor_min: float, municipio_filtro: s
     return e
 
 @st.cache_data(ttl=300, show_spinner=False)
-def varrer(dias: int, mods: tuple, valor_min: float, municipio_filtro: str, 
-           modo: str = "RADAR", uf_manual: str = "", termo_manual: str = "") -> list[dict]:
-    """Varre PNCP em modo paralelo suportando Radar ou Explorador Manual."""
-    di, df = _data_str(dias)
+def varrer(di: str, df: str, mods: tuple, valor_min: float, municipio_filtro: str, 
+           modo: str = "RADAR", ufs_alvo: list[str] = [], termo_manual: str = "", uasg_manual: str = "") -> list[dict]:
+    """Varre PNCP em modo paralelo suportando múltiplos estados e termos customizados."""
     tarefas = []
     
+    # Se não houver UFs selecionadas, usamos uma lista com string vazia (Brasil Todo)
+    ufs_processar = ufs_alvo if ufs_alvo else [""]
+
     if modo == "RADAR":
-        for mod in mods:
-            for pg in [1, 2]:
-                tarefas.append(("FEDERAL", "", mod, pg, ""))
-        for uf in UFS_REGIONAL:
+        # No Radar, buscamos nos estados selecionados + busca federal
+        for uf in ufs_processar:
+            radar_lbl = "REGIONAL" if uf else "FEDERAL"
             for mod in mods:
                 for pg in [1, 2]:
-                    tarefas.append(("REGIONAL", uf, mod, pg, ""))
+                    # Agora o Radar também aceita o termo da sidebar se fornecido (CNAEs manuais)
+                    tarefas.append((radar_lbl, uf, mod, pg, termo_manual, uasg_manual))
     else:
-        radar_lbl = "EXPLORADOR"
-        ufs = [uf_manual] if uf_manual else [""]
-        for uf in ufs:
+        # No Explorador, buscamos estritamente nos estados selecionados ou Brasil
+        for uf in ufs_processar:
             for mod in mods:
-                for pg in [1, 2, 3]:
-                    tarefas.append((radar_lbl, uf, mod, pg, termo_manual))
+                for pg in [1, 2, 3, 4, 5]:
+                    tarefas.append(("EXPLORADOR", uf, mod, pg, termo_manual, uasg_manual))
 
     resultados_filtrados = {}
     progress_text = f"Varrendo PNCP ({modo})..."
     prog_bar = st.progress(0, text=progress_text)
     
     total_t = len(tarefas)
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(buscar_pagina, di, df, uf, mod, pg, termo): (radar, uf, mod, pg, termo) 
-                   for radar, uf, mod, pg, termo in tarefas}
+    if total_t == 0: return []
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(buscar_pagina, di, df, uf, mod, pg, termo, uasg): (radar, uf, mod, pg, termo, uasg) 
+                   for radar, uf, mod, pg, termo, uasg in tarefas}
         
         for i, future in enumerate(as_completed(futures)):
-            radar, uf, mod, pg, termo = futures[future]
+            radar, uf, mod, pg, termo, uasg = futures[future]
             try:
                 items = future.result()
                 if items:
@@ -580,12 +686,12 @@ def varrer(dias: int, mods: tuple, valor_min: float, municipio_filtro: str,
                             chave = processado["_pncp_num"]
                             if chave not in resultados_filtrados or radar == "REGIONAL":
                                 resultados_filtrados[chave] = processado
-                
-                pct = int((i + 1) / total_t * 100)
-                prog_bar.progress(pct, text=f"Radar {modo} - {uf or 'BR'} {pg}... {pct}%")
             except Exception:
                 continue
-
+            
+            pct = int((i + 1) / total_t * 100)
+            prog_bar.progress(pct / 100, text=f"Radar {modo} - {uf or 'BR'}... {pct}%")
+            
     prog_bar.empty()
     res = list(resultados_filtrados.values())
     res.sort(key=lambda x: (x.get("_dias") or 9999))
@@ -674,24 +780,68 @@ st.markdown("""
 
 # ── Sidebar — Modo de Busca ────────────────────────────────────
 with st.sidebar:
+    st.markdown("---")
     st.markdown("### 🏹 Modo de Operação")
     modo_op = st.radio(
         "Selecione o motor de busca:",
         options=["📡 Radar Inteligente", "🔍 Explorador Manual"],
         help="Radar: Pesquisa automática setores configurados. Explorador: Busca livre por termo e estado."
     )
+    
+    # ── Configuração Dinâmica de IA ──
+    st.markdown("### 🤖 Nível de Inteligência (IA)")
+    perfil_ia_sel = st.radio(
+        "Selecione o perfil desejado:",
+        options=list(PERFIS_IA.keys()),
+        index=0, # Econômico por padrão
+        help="Econômico: Modelos grátis. Premium: GPT-4o p/ máxima precisão e zero erros de cota."
+    )
+    model_ia_ativo = PERFIS_IA[perfil_ia_sel]["primary"]
+    fallback_ia_ativo = PERFIS_IA[perfil_ia_sel]["fallback"]
+    
+    def detectar_cnaes_na_sidebar(contexto: str):
+        """Função auxiliar para detectar e listar CNAEs em qualquer modo."""
+        text_area_label = "CNAEs/Termos Adicionais" if contexto == "RADAR" else "Palavra-chave (Objeto)"
+        help_txt = "Cole códigos CNAE ou termos para o robô monitorar."
+        
+        txt_input = st.text_area(text_area_label, placeholder="Ex: 8610-1/02 ou 'vigilância'...", height=80 if contexto == "RADAR" else 100, help=help_txt)
+        
+        codigos_encontrados = sorted(list(set(re.findall(r'(\d{4}-\d/\d{2})', txt_input))))
+        termos_adicionais = []
+        
+        if codigos_encontrados:
+            with st.expander(f"📍 {len(codigos_encontrados)} CNAEs Detectados", expanded=True):
+                for codigo in codigos_encontrados:
+                    if codigo in DICIONARIO_CNAE:
+                        desc = DICIONARIO_CNAE[codigo]
+                        st.markdown(f"**{codigo}**: {desc}")
+                        if st.checkbox(f"Incluir na busca", value=True, key=f"btn_cnae_{contexto}_{codigo}"):
+                            termos_adicionais.append(desc)
+                    else:
+                        st.warning(f"⚠️ **{codigo}**: Não catalogado.")
+        
+        # Retorna o texto original + as descrições dos CNAEs marcados
+        prefixo = txt_input.strip()
+        sufixo = " ".join(termos_adicionais) if termos_adicionais else ""
+        return f"{prefixo} {sufixo}".strip()
+
     st.markdown("---")
 
     st.markdown("### ⚙️ Filtros Gerais")
-    dias = st.selectbox(
+    
+    # ── Revertendo para Seleção de Dias (Conforme solicitado) ──
+    dias_atras = st.selectbox(
         "Período (publicação)",
-        options=[1, 3, 7, 15, 30],
+        options=[1, 3, 7, 15, 30, 45, 60],
         index=2,
         format_func=lambda x: f"Últimos {x} dia(s)"
     )
+    di_str, df_str = _data_str(dias_atras)
 
     if "Radar" in modo_op:
         st.info("📡 **Radar Híbrido Ativo:**\n- **Nacional**: Saúde e Social\n- **Regional (GO/DF)**: Infraestrutura")
+        termo_manual = detectar_cnaes_na_sidebar("RADAR")
+        
         opcoes_servicos = list(CNAES_FEDERAL.keys()) + list(CNAES_REGIONAL.keys())
         servicos_sel = st.multiselect(
             "Filtrar Resultados por Serviço",
@@ -699,20 +849,44 @@ with st.sidebar:
             default=opcoes_servicos
         )
         uf_manual = ""
-        termo_manual = ""
-    else:
-        st.success("🔍 **Explorador Manual Ativado**\nLivre de categorias fixas.")
-        termo_manual = st.text_input("Palavra-chave (Obrigatório)", placeholder="Ex: vigilância, limpeza, TI...")
-        uf_manual = st.selectbox("Estado (UF)", options=[""] + ["AC", "AL", "AP", "AM", "BA", "CE", "DF", "ES", "GO", "MA", "MT", "MS", "MG", "PA", "PB", "PR", "PE", "PI", "RJ", "RN", "RS", "RO", "RR", "SC", "SP", "SE", "TO"], format_func=lambda x: "🇧🇷 Brasil Todo" if x == "" else x)
-        servicos_sel = []
+        uasg_manual = ""
+    # ── Unidades da Federação (Painel de Marcações) ──
+    st.markdown("### 📍 Estados (UFs)")
+    ufs_selecionadas = []
+    todas_ufs = ["AC", "AL", "AP", "AM", "BA", "CE", "DF", "ES", "GO", "MA", "MT", "MS", "MG", "PA", "PB", "PR", "PE", "PI", "RJ", "RN", "RS", "RO", "RR", "SC", "SP", "SE", "TO"]
+    
+    with st.expander("Selecionar Estados", expanded=False):
+        col_uf1, col_uf2, col_uf3 = st.columns(3)
+        for i, uf_code in enumerate(todas_ufs):
+            target_col = [col_uf1, col_uf2, col_uf3][i % 3]
+            # Por padrão, se for Radar, GO e DF podem vir marcados
+            default_val = uf_code in ["GO", "DF"] if "Radar" in modo_op else False
+            if target_col.checkbox(uf_code, value=default_val, key=f"check_uf_{uf_code}"):
+                ufs_selecionadas.append(uf_code)
 
-    mods_sel = st.multiselect(
-        "Modalidades",
-        options=list(MODALIDADES.keys()),
-        default=[6, 7],
-        format_func=lambda x: MODALIDADES[x],
-    )
+    st.markdown("---")
+    st.markdown("### ✅ Modalidades (Marcações)")
+    mods_sel = []
+    from config import MODALIDADES
+    
+    cols_check = st.columns(2)
+    for idx, (cod, nome) in enumerate(MODALIDADES.items()):
+        container_col = cols_check[0] if idx % 2 == 0 else cols_check[1]
+        marcado_padrao = cod in [5, 6]
+        if container_col.checkbox(nome, value=marcado_padrao, key=f"check_mod_{cod}"):
+            mods_sel.append(cod)
 
+    # ── Tipos de Pregão (Sub-marcações estilo Compras.gov) ──
+    tipos_pregao_sel = []
+    if 5 in mods_sel: # Se Pregão estiver selecionado
+        with st.expander("🎯 Detalhar Tipos de Pregão", expanded=True):
+            tp1, tp2 = st.columns(2)
+            if tp1.checkbox("Eletrônico SRP", value=True, key="tp_e_srp"): tipos_pregao_sel.append("E-SRP")
+            if tp2.checkbox("Eletrônico", value=True, key="tp_e"): tipos_pregao_sel.append("E")
+            if tp1.checkbox("Presencial SRP", value=False, key="tp_p_srp"): tipos_pregao_sel.append("P-SRP")
+            if tp2.checkbox("Presencial", value=False, key="tp_p"): tipos_pregao_sel.append("P")
+    
+    st.markdown("---")
     ia_ativa = st.toggle("Ativar Consultoria IA 🧠", value=True, help="Usa IA para resumir o edital e dar dicas estratégicas")
 
     valor_min = st.number_input(
@@ -783,31 +957,86 @@ with aba_analista:
         st.session_state.chat_messages = []
     if "pdf_context" not in st.session_state:
         st.session_state.pdf_context = ""
-    if "pdf_filename" not in st.session_state:
-        st.session_state.pdf_filename = ""
+    if "pdf_filenames" not in st.session_state:
+        st.session_state.pdf_filenames = []
+    if "pdf_summary" not in st.session_state:
+        st.session_state.pdf_summary = ""
+    if "pdf_images" not in st.session_state:
+        st.session_state.pdf_images = []
 
-    # Uploader
-    uploaded_file = st.file_uploader("📂 Arraste o PDF do edital aqui", type="pdf", key="analista_pdf_uploader")
+    # Uploader com suporte a múltiplos arquivos
+    uploaded_files = st.file_uploader("📂 Arraste os PDFs (edital e anexos) aqui", type="pdf", key="analista_pdf_uploader", accept_multiple_files=True)
 
-    if uploaded_file:
-        if st.session_state.pdf_filename != uploaded_file.name:
-            with st.spinner("⏳ Lendo e interpretando edital..."):
-                texto = extrair_texto_pdf(uploaded_file)
-                st.session_state.pdf_context = texto
-                st.session_state.pdf_filename = uploaded_file.name
-                st.session_state.chat_messages = [] # Limpa chat ao mudar de edital
-                st.success(f"✅ Edital '{uploaded_file.name}' carregado com sucesso!")
+    # Novo: Controle manual de OCR
+    forcar_visao = st.checkbox("👁️ Forçar Modo Visão (OCR)", help="Use isso se o edital for escaneado e a IA não estiver lendo corretamente.")
+
+    if uploaded_files:
+        # Extrai nomes atuais
+        nomes_atuais = [f.name for f in uploaded_files]
+        
+        # Se houve mudança nos arquivos carregados ou mudança no checkbox de visão
+        check_visao_mudou = st.session_state.get("ultimo_forcar_visao") != forcar_visao
+        
+        if set(st.session_state.pdf_filenames) != set(nomes_atuais) or check_visao_mudou:
+            st.session_state.ultimo_forcar_visao = forcar_visao
+            with st.spinner("⏳ Lendo e consolidando documentos com IA Master..."):
+                novo_texto = ""
+                todas_imagens = []
+                for up_file in uploaded_files:
+                    novo_texto += f"\n\n=== DOCUMENTO: {up_file.name} ===\n"
+                    txt_extraido = extrair_texto_pdf(up_file)
+                    novo_texto += txt_extraido
+                    
+                    # Se o texto for suspeito (muito curto) OU o usuário forçou a visão
+                    if len(txt_extraido) < 150 or forcar_visao:
+                        imgs = extrair_paginas_como_imagens(up_file, max_paginas=5 if forcar_visao else 3)
+                        todas_imagens.extend(imgs)
+                
+                st.session_state.pdf_context = novo_texto
+                st.session_state.pdf_filenames = nomes_atuais
+                st.session_state.pdf_images = todas_imagens
+                st.session_state.chat_messages = [] 
+                
+                # Gera o resumo automático proativo (Suporta Visão)
+                st.session_state.pdf_summary = gerar_resumo_proativo_ia(novo_texto, model_ia_ativo, fallback_ia_ativo, todas_imagens)
+                st.success(f"✅ {len(nomes_atuais)} arquivo(s) carregado(s) com sucesso!")
 
     if st.session_state.pdf_context:
-        st.markdown("---")
-        # Container de Chat
-        chat_container = st.container(height=400)
-        
-        with chat_container:
-            for message in st.session_state.chat_messages:
-                with st.chat_message(message["role"]):
-                    st.markdown(message["content"])
+        # 1. Exibe o Resumo Inteligente Proativo (Destaque principal)
+        if st.session_state.pdf_summary:
+            with st.container(border=True):
+                st.markdown(st.session_state.pdf_summary)
+                col_btn1, col_btn2 = st.columns([1, 1])
+                with col_btn1:
+                    if st.button("🔄 Atualizar Análise", use_container_width=True, help="Refaz a análise proativa"):
+                        with st.spinner("Refazendo análise técnica..."):
+                            st.session_state.pdf_summary = gerar_resumo_proativo_ia(
+                                st.session_state.pdf_context, 
+                                model_ia_ativo, 
+                                fallback_ia_ativo,
+                                st.session_state.get("pdf_images")
+                            )
+                            st.rerun()
+                with col_btn2:
+                    st.download_button(
+                        label="📥 Baixar Relatório (TXT)",
+                        data=st.session_state.pdf_summary,
+                        file_name=f"Relatorio_{st.session_state.pdf_filenames[0] if st.session_state.pdf_filenames else 'Edital'}.txt",
+                        mime="text/plain",
+                        use_container_width=True
+                    )
 
+        # 2. Área de Chat (Histórico)
+        if st.session_state.chat_messages:
+            st.markdown("---")
+            chat_container = st.container(height=400)
+            with chat_container:
+                for message in st.session_state.chat_messages:
+                    with st.chat_message(message["role"]):
+                        st.markdown(message["content"])
+        else:
+            chat_container = st.empty()
+        
         # Input de Chat
         if prompt := st.chat_input("Pergunte algo sobre este edital..."):
             # Adiciona mensagem do usuário
@@ -822,8 +1051,10 @@ with aba_analista:
                     with st.spinner("Pensando..."):
                         resposta = obter_pergunta_ia(
                             prompt, 
-                            st.session_state.pdf_context, 
-                            st.session_state.chat_messages[:-1]
+                            st.session_state.pdf_context,
+                            st.session_state.chat_messages[:-1], # Remove a própria pergunta do histórico
+                            model_ia=model_ia_ativo,
+                            fallback=fallback_ia_ativo
                         )
                         st.markdown(resposta)
             
@@ -855,20 +1086,51 @@ if modo_slug == "MANUAL" and not termo_manual:
     st.stop()
 
 with st.spinner(f"Consultando API do PNCP ({modo_op})…"):
+    # Realizamos uma varredura única enviando a lista completa de estados e modalidades
     editais = varrer(
-        dias,
+        di_str,
+        df_str,
         tuple(mods_sel),
         float(valor_min),
         municipio_filtro.strip(),
         modo=modo_slug,
-        uf_manual=uf_manual,
-        termo_manual=termo_manual.strip()
+        ufs_alvo=ufs_selecionadas,
+        termo_manual=termo_manual.strip(),
+        uasg_manual=uasg_manual.strip()
     )
+
+# ── Filtragem Local Avançada (Tipos de Pregão) ────────────────
+if editais and 5 in mods_sel and tipos_pregao_sel:
+    filtered_pregao = []
+    for e in editais:
+        if e.get("codigoModalidadeContratacao") == 5:
+            # Lógica de detecção de tipo (SRP, Eletrônico/Presencial)
+            is_srp = e.get("informacaoSrp") is True
+            # No PNCP, presencial vs eletrônico costuma estar no campo 'presencial' (bool) 
+            # ou em campos de detalhes. Se não houver, assumimos Eletrônico (mais comum)
+            is_presencial = e.get("presencial") is True
+            
+            match = False
+            if "E-SRP" in tipos_pregao_sel and not is_presencial and is_srp: match = True
+            if "E" in tipos_pregao_sel and not is_presencial and not is_srp: match = True
+            if "P-SRP" in tipos_pregao_sel and is_presencial and is_srp: match = True
+            if "P" in tipos_pregao_sel and is_presencial and not is_srp: match = True
+            
+            if match: filtered_pregao.append(e)
+        else:
+            filtered_pregao.append(e) # Mantém outras modalidades
+    editais = filtered_pregao
 
 # ── Filtragem Local (Apenas para modo Radar) ─────────────────
 if editais and modo_slug == "RADAR":
-    if servicos_sel:
-        editais = [e for e in editais if e["_cnae"] in servicos_sel]
+    # No Radar, os termos customizados (CNAEs manuais) são somados aos serviços do multiselect
+    permitidos = set(servicos_sel) if servicos_sel else set()
+    if termo_manual:
+        permitidos.add("🔍 Termo Customizado")
+    
+    # Se houver filtros ativos, aplicamos a restrição
+    if permitidos:
+        editais = [e for e in editais if e["_cnae"] in permitidos]
     
     if termo_filtro:
         editais = [e for e in editais if termo_filtro.lower() in (e.get("objetoCompra") or "").lower()]
@@ -936,25 +1198,24 @@ def renderizar_editais(lista: list[dict], ja_enviado: bool = False, prefixo: str
 
     for i, e in enumerate(lista, 1):
         pncp_num = e.get("numeroControlePNCP") or f"ID-{i}"
-        orgao    = e["_orgao"]
+        orgao    = e.get("_orgao") or "Órgão não identificado"
         municipio = e.get("_municipio") or ""
         uf        = e.get("_uf") or ""
         objeto    = limpar_html(e.get("objetoCompra") or "Objeto não informado")
-        cnae      = e["_cnae"]
-        valor     = e["_valor_fmt"]
+        cnae      = e.get("_cnae") or "—"
+        valor     = e.get("_valor_fmt") or "—"
         dias_r    = e.get("_dias")
-        abertura  = e["_abertura_fmt"]
-        encerra   = e["_encerra_fmt"]
-        modalidade= e["_modalidade"]
-        link      = e["_link"]
+        abertura  = e.get("_abertura_fmt") or "—"
+        encerra   = e.get("_encerra_fmt") or "—"
+        modalidade= e.get("_modalidade") or "—"
+        link      = e.get("_link") or "#"
 
         # IDs para busca de arquivos (Download Direto)
-        # O PNCP usa CNPJ/ANO/SEQUENCIAL no path dos arquivos
         cnpj_orgao = (e.get("orgaoEntidade") or {}).get("cnpj")
         ano_compra = e.get("anoCompra")
         seq_compra = e.get("sequencialCompra")
 
-        # Cor da borda
+        # Cor da borda baseada em prazos
         if dias_r is not None and dias_r <= 2:
             card_class  = "edital-card urgente"
             badge_class = "badge badge-vermelho"
@@ -978,28 +1239,34 @@ def renderizar_editais(lista: list[dict], ja_enviado: bool = False, prefixo: str
         else:
             historico_badge = ""
 
-        # Renderização HTML limpa
+        # Renderização HTML protegida com escape para evitar quebras de layout
+        safe_orgao     = html.escape(str(orgao))
+        safe_municipio = html.escape(str(municipio))
+        safe_uf        = html.escape(str(uf))
+        safe_objeto    = html.escape(objeto[:600]) + ('...' if len(objeto) > 600 else '')
+        safe_pncp      = html.escape(str(pncp_num))
+
         st.markdown(f"""
         <div class="{card_class}">
           <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:6px; margin-bottom:6px;">
             <div>
-              <div class="edital-numero">#{i} · {pncp_num}</div>
-              <div class="edital-orgao">{orgao}</div>
-              {f'<div style="font-size:12px;color:#666;">📍 {municipio} · {uf}</div>' if municipio else ''}
+              <div class="edital-numero">#{i} · {safe_pncp}</div>
+              <div class="edital-orgao">{safe_orgao}</div>
+              {f'<div style="font-size:12px;color:#666;">📍 {safe_municipio} · {safe_uf}</div>' if safe_municipio else ''}
             </div>
             <div>
               <span class="{badge_class}">{badge_txt}</span>
               {historico_badge}
             </div>
           </div>
-          <div class="edital-objeto"><strong>Objeto:</strong> {objeto[:600]}{'...' if len(objeto) > 600 else ''}</div>
+          <div class="edital-objeto"><strong>Objeto:</strong> {safe_objeto}</div>
           <div class="badge-ia" style="margin-top:6px; margin-bottom:10px;">📡 Radar {e.get("_radar")}</div>
           <div class="edital-meta">
-            <span>📋 <strong>Modalidade:</strong> {modalidade}</span>
-            <span>📌 <strong>CNAE:</strong> {cnae.split('·')[0].strip()}</span>
-            <span>💰 <strong>Valor:</strong> {valor}</span>
-            <span>📅 <strong>Abertura:</strong> {abertura}</span>
-            <span>⏳ <strong>Encerramento:</strong> {encerra}</span>
+            <span>📋 <strong>Modalidade:</strong> {html.escape(str(modalidade))}</span>
+            <span>📌 <strong>CNAE:</strong> {html.escape(str(cnae).split('·')[0].strip())}</span>
+            <span>💰 <strong>Valor:</strong> {html.escape(str(valor))}</span>
+            <span>📅 <strong>Abertura:</strong> {html.escape(str(abertura))}</span>
+            <span>⏳ <strong>Encerramento:</strong> {html.escape(str(encerra))}</span>
           </div>
         </div>
         """, unsafe_allow_html=True)
