@@ -850,6 +850,12 @@ with st.sidebar:
         )
         uf_manual = ""
         uasg_manual = ""
+    else:
+        st.info("🔍 **Explorador Manual:**\nFaça buscas livres por palavra-chave e estados.")
+        termo_manual = detectar_cnaes_na_sidebar("MANUAL")
+        servicos_sel = []
+        uf_manual = ""
+        uasg_manual = ""
     # ── Unidades da Federação (Painel de Marcações) ──
     st.markdown("### 📍 Estados (UFs)")
     ufs_selecionadas = []
@@ -928,9 +934,13 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # Informação sobre deduplicação
+    # Contador de editais localizados na sessão atual
+    if "count_sessao" not in st.session_state:
+        st.session_state.count_sessao = 0
+
     ids_enviados = _carregar_enviados()
-    st.caption(f"🗂️ {len(ids_enviados)} edital(is) já registrado(s) no histórico")
+    st.markdown(f"### 🗂️ {st.session_state.count_sessao} Edital(is) Localizado(s)")
+    st.caption(f"Registro total acumulado: {len(ids_enviados)} no histórico")
 
     col_a, col_b = st.columns(2)
     with col_a:
@@ -1134,9 +1144,11 @@ if editais and modo_slug == "RADAR":
     
     if termo_filtro:
         editais = [e for e in editais if termo_filtro.lower() in (e.get("objetoCompra") or "").lower()]
-elif editais and modo_slug == "MANUAL" and termo_filtro:
     # No manual, o termo_filtro serve como refinamento extra
     editais = [e for e in editais if termo_filtro.lower() in (e.get("objetoCompra") or "").lower()]
+
+# Atualiza contador da sessão para o badge do sidebar
+st.session_state.count_sessao = len(editais) if editais else 0
 
 # ── Carrega histórico de enviados ────────────────────────────
 ids_enviados = _carregar_enviados()
